@@ -362,24 +362,87 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 
 
 # ═══════════════════════════════════════════════
-# 🛑 5. АНТИ-СПАМ: @everyone + ССЫЛКИ НА СЕРВЕРА / НИТРО
+# 🛑 5. АНТИ-СПАМ: ДУБЛИКАТЫ + ФЛУД + @everyone
 # ═══════════════════════════════════════════════
+# Трекеры сообщений
+msg_speed_tracker = FastTracker(window=4.0, limit=6)  # 6 сообщений за 4 сек -> мут
+dup_msg_cache: dict[int, list[tuple[float, str]]] = defaultdict(list)
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if not message.guild or message.author.bot or is_immune(message.author.id):
         await bot.process_commands(message)
         return
 
-    content = message.content.lower()
-    has_mass_ping = message.mention_everyone or len(message.mentions) >= 5
-    has_scam_link = bool(re.search(r"(discord\.(gg|io|me|li)|discordapp\.com/invite|t\.me/|nitro|steam)", content))
+    content = message.content.strip()
+    content_lower = content.lower()
+    uid = message.author.id
+    now = time.monotonic()
 
+    # 1. Проверка на краш-рассылку: @everyone + ссылка
+    has_mass_ping = message.mention_everyone or len(message.mentions) >= 5
+    has_scam_link = bool(re.search(r"(discord\.(gg|io|me|li)|discordapp\.com/invite|t\.me/|nitro|steam)", content_lower))
     if has_mass_ping and has_scam_link:
         try:
             await message.delete()
         except Exception:
             pass
         await fast_ban(message.guild, message.author, "Краш-рассылка с @everyone")
+        return
+
+    # 2. Проверка на одинаковые (дублирующиеся) сообщения
+    if content:
+        # Очищаем старые записи (> 12 секунд)
+        dup_msg_cache[uid] = [(t, txt) for t, txt in dup_msg_cache[uid] if now - t < 12.0]
+        dup_msg_cache[uid].append((now, content_lower))
+
+        # Считаем сколько раз это же сообщение отправлено за последние 12 секунд
+        same_count = sum(1 for _, txt in dup_msg_cache[uid] if txt == content_lower)
+
+        # Если 4 и более одинаковых сообщений — удаляем дубликат
+        if same_count >= 4:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+        # Если 5 одинаковых сообщений — выдаем мут (таймаут) на 5 минут
+        if same_count == 5:
+            member = message.guild.get_member(uid)
+            if member:
+                # Если у нарушителя есть админка — снимаем роли чтобы мут сработал
+                if member.guild_permissions.administrator:
+                    removable = [r for r in member.roles if not r.is_default() and not r.managed]
+                    if removable:
+                        try:
+                            await member.remove_roles(*removable, reason="Анти-Спам: дубликаты сообщений")
+                        except Exception:
+                            pass
+                try:
+                    await member.timeout(discord.utils.utcnow() + timedelta(minutes=5), reason="Анти-Спам: спам одинаковыми сообщениями")
+                    asyncio.create_task(send_alert(
+                        message.guild,
+                        "🔇 АВТО-МУТ ЗА ДУБЛИКАТЫ",
+                        f"**Нарушитель:** {member.mention} (`{member.id}`)\n**Причина:** Отправлено 5+ одинаковых сообщений подряд",
+                        discord.Color.orange()
+                    ))
+                except Exception:
+                    pass
+            return
+
+    # 3. Проверка на скорость сообщений (флуд)
+    if msg_speed_tracker.add_and_check(uid):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        member = message.guild.get_member(uid)
+        if member:
+            try:
+                await member.timeout(discord.utils.utcnow() + timedelta(minutes=5), reason="Анти-Флуд: слишком частые сообщения")
+            except Exception:
+                pass
         return
 
     await bot.process_commands(message)
