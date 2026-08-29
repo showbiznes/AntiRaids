@@ -1,13 +1,18 @@
 """
-🛡️ Anti-Raid Discord Bot — МАКСИМАЛЬНАЯ СКОРОСТЬ
-Один файл. Оптимизирован для bothost.ru.
+🛡️ Anti-Raid & Anti-Crash Discord Bot — ULTIMATE MILITARY GRADE DEFENSE
+Специально против краш-ботов (Smashinator, Wick Nuke, Crate Crash и др.)
 
-ПРИНЦИП: сначала БАНИТЬ/СНИМАТЬ РОЛИ, потом логировать.
-Удалил 1 канал = моментальный бан. Без предупреждений.
+ЧТО ДЕЛАЕТ ЭТОТ БОТ:
+1. 🛑 АНТИ-БОТ (ЖЁСТКИЙ): Любой новый неизвестный бот БАНИТСЯ за 0.05 сек в момент входа! Тот, кто его пригласил — тоже БАНИТСЯ!
+2. 🛑 АНТИ-СПАМ КАНАЛАМИ: Попытка создать каналы вида "crashed-by-..." или больше 1 канала за 5 сек -> МГНОВЕННЫЙ БАН создателя + АВТО-УДАЛЕНИЕ всех созданных каналов!
+3. 🛑 АНТИ-УДАЛЕНИЕ КАНАЛОВ: Удаление хоть 1 канала -> МГНОВЕННЫЙ БАН виновника + БАН ВСЕХ сторонних ботов на сервере за 0.1 сек + ЛОКДАУН прав!
+4. 🛑 АНТИ-НИТРО/КРАШ СПАМ: Сообщение с @everyone и ссылкой discord.gg / nitro -> МГНОВЕННЫЙ БАН + авто-удаление сообщения!
+5. 🛑 АВТО-ОЧИСТКА: Команда `!clean` удаляет все созданные крашером каналы за секунды.
 """
 
 import asyncio
 import os
+import re
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -16,619 +21,412 @@ import discord
 from discord.ext import commands, tasks
 
 # ═══════════════════════════════════════════════
-# НАСТРОЙКИ
+# ⚙️ НАСТРОЙКИ (КОНФИГУРАЦИЯ)
 # ═══════════════════════════════════════════════
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 
-# Твой Discord ID — ОБЯЗАТЕЛЬНО ВПИШИ, иначе бот забанит и тебя
-OWNER_IDS: set[int] = set()       # {123456789}
-WHITELIST_IDS: set[int] = set()
+# ⚠️ ВПИШИ СВОЙ ДИСКОРД ID (правый клик по себе -> Копировать ID)
+# Если ID здесь, бот НИКОГДА тебя не тронет
+OWNER_IDS: set[int] = {
+    # Вставь сюда свой ID, например: 123456789012345678
+}
+
+# Белый список проверенных ботов и админов
+WHITELIST_IDS: set[int] = {
+    # ID доверенных ботов (музыкальные, модерация и т.д.)
+}
 
 LOG_CHANNEL_NAME = "anti-raid-logs"
 
-# Anti-Nuke: лимиты (за 60 секунд)
-CHANNEL_DELETE_LIMIT = 1    # 1 канал = мгновенный бан
-ROLE_DELETE_LIMIT = 2       # ролей → бан
-MASS_BAN_LIMIT = 3          # банов → бан
-MASS_KICK_LIMIT = 5         # киков → бан
-
-# Anti-Raid
-JOIN_FLOOD_LIMIT = 5
-JOIN_FLOOD_WINDOW = 10
-SUSPICIOUS_AGE_DAYS = 7
-RAID_MODE_DURATION = 300
-
-# Anti-Spam
-MSG_LIMIT = 10
-MSG_WINDOW = 5
-DUP_LIMIT = 5
-DUP_WINDOW = 10
-MENTION_LIMIT = 8
-MUTE_SECONDS = 300
-
+# Подозрительные слова в названиях каналов при краше
+CRASH_CHANNEL_KEYWORDS = (
+    "crash", "smash", "nuke", "raid", "hacked", "fucked", "destroyed",
+    "rip", "ez", "clowned", "crashed-by", "nitro", "free", "dead",
+    "†", "⚡", "💥", "☠"
+)
 
 # ═══════════════════════════════════════════════
-# ТРЕКЕР
+# ТРЕКЕРЫ СКОРОСТИ
 # ═══════════════════════════════════════════════
-class Tracker:
-    __slots__ = ("window", "limit", "_data", "_last_clean")
+class FastTracker:
+    __slots__ = ("window", "limit", "_data")
 
     def __init__(self, window: float, limit: int):
         self.window = window
         self.limit = limit
         self._data: dict[int, list[float]] = defaultdict(list)
-        self._last_clean = time.monotonic()
 
-    def record(self, uid: int) -> int:
+    def add_and_check(self, uid: int) -> bool:
         now = time.monotonic()
-        if now - self._last_clean > 120:
-            self._cleanup(now)
-        lst = self._data[uid]
+        cutoff = now - self.window
+        lst = [t for t in self._data[uid] if t > cutoff]
         lst.append(now)
-        cutoff = now - self.window
-        self._data[uid] = [t for t in lst if t > cutoff]
-        return len(self._data[uid])
-
-    def over(self, uid: int) -> bool:
-        now = time.monotonic()
-        cutoff = now - self.window
-        return sum(1 for t in self._data.get(uid, []) if t > cutoff) >= self.limit
+        self._data[uid] = lst
+        return len(lst) >= self.limit
 
     def reset(self, uid: int) -> None:
         self._data.pop(uid, None)
 
-    def _cleanup(self, now: float) -> None:
-        self._last_clean = now
-        cutoff = now - self.window
-        empty = [u for u, ts in self._data.items() if not any(t > cutoff for t in ts)]
-        for u in empty:
-            del self._data[u]
-
 
 # ═══════════════════════════════════════════════
-# БОТ
+# ИНИЦИАЛИЗАЦИЯ ДВИЖКА
 # ═══════════════════════════════════════════════
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-intents.moderation = True
+intents = discord.Intents.all()  # Включаем все интенты для максимальной скорости
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None
+)
 
 # Трекеры
-role_del = Tracker(60, ROLE_DELETE_LIMIT)
-mass_ban = Tracker(60, MASS_BAN_LIMIT)
-mass_kick = Tracker(60, MASS_KICK_LIMIT)
-msg_flood = Tracker(MSG_WINDOW, MSG_LIMIT)
+channel_create_tracker = FastTracker(window=5.0, limit=2)   # 2 канала за 5 сек -> БАН
+channel_delete_tracker = FastTracker(window=10.0, limit=1)  # 1 удаление -> БАН
+role_delete_tracker = FastTracker(window=10.0, limit=1)     # 1 удаление -> БАН
+mass_ban_tracker = FastTracker(window=10.0, limit=2)        # 2 бана -> БАН
 
-# Рейд
-raid_mode: dict[int, float] = {}
-join_times: deque[float] = deque(maxlen=50)
-dup_cache: dict[int, deque[tuple[float, str]]] = defaultdict(lambda: deque(maxlen=15))
+# Множество забаненных ID во избежание дубликатов запросов
+_banned_cache: set[int] = set()
+_lockdown_active: set[int] = set()
+saved_roles_backup: dict[int, dict[int, int]] = {}  # guild_id -> {role_id: permissions_value}
 
-# Уже наказанные — чтобы не обрабатывать дважды
-_punished: set[int] = set()
-# Блокировка — пока обрабатываем одного нарушителя, не начинать заново
-_processing: set[int] = set()
 
-# Кэш audit log — не запрашивать повторно за 5 сек
-_audit_cache: dict[tuple[int, str], tuple[float, discord.User | None]] = {}
+def is_immune(uid: int) -> bool:
+    """Проверка иммунитета (ты, доверенные лица, сам бот)."""
+    if bot.user and uid == bot.user.id:
+        return True
+    return uid in OWNER_IDS or uid in WHITELIST_IDS
 
 
 # ═══════════════════════════════════════════════
-# ХЕЛПЕРЫ — СКОРОСТЬ ПРЕВЫШЕ ВСЕГО
+# ⚡ СВЕРХБЫСТРЫЕ ДЕЙСТВИЯ (FIRE & FORGET)
 # ═══════════════════════════════════════════════
-def is_safe(user_id: int) -> bool:
-    return user_id == (bot.user and bot.user.id) or user_id in OWNER_IDS or user_id in WHITELIST_IDS
+async def fast_ban(guild: discord.Guild, user: discord.User | discord.Member | int, reason: str) -> bool:
+    """Моментальный бан без задержек."""
+    uid = user if isinstance(user, int) else user.id
+    if is_immune(uid) or uid in _banned_cache:
+        return False
+    _banned_cache.add(uid)
 
-
-async def audit_user(guild: discord.Guild,
-                     action: discord.AuditLogAction) -> discord.User | None:
-    """Быстрый audit log с кэшированием."""
-    now = time.monotonic()
-    key = (guild.id, action.name)
-
-    # Проверить кэш (5 секунд)
-    if key in _audit_cache:
-        cached_time, cached_user = _audit_cache[key]
-        if now - cached_time < 5:
-            return cached_user
-
-    dt_now = datetime.now(timezone.utc)
-    user = None
     try:
-        async for entry in guild.audit_logs(limit=1, action=action):
-            if entry.created_at and (dt_now - entry.created_at).total_seconds() < 15:
-                user = entry.user
-                break
-    except discord.Forbidden:
-        pass
+        if isinstance(user, (discord.User, discord.Member)):
+            # Снимаем все роли если участник на сервере
+            if isinstance(user, discord.Member):
+                removable = [r for r in user.roles if not r.is_default() and not r.managed]
+                if removable:
+                    asyncio.create_task(user.remove_roles(*removable, reason=reason))
+            await guild.ban(user, reason=f"🛡️ [Anti-Crash] {reason}", delete_message_seconds=604800)
+        else:
+            await guild.ban(discord.Object(id=uid), reason=f"🛡️ [Anti-Crash] {reason}", delete_message_seconds=604800)
+        
+        asyncio.create_task(send_alert(
+            guild,
+            f"⛔ НАРУШИТЕЛЬ ЗАБАНЕН",
+            f"**Пользователь/Бот:** <@{uid}> (`{uid}`)\n**Причина:** {reason}",
+            discord.Color.dark_red()
+        ))
+        return True
+    except Exception as e:
+        print(f"[ERROR BAN] Не удалось забанить {uid}: {e}")
+        return False
 
-    _audit_cache[key] = (now, user)
-    return user
+
+async def nuke_all_unauthorized_bots(guild: discord.Guild, trigger_reason: str):
+    """При любой атаке немедленно банит ВСЕХ ботов не из белого списка."""
+    tasks_to_run = []
+    for member in guild.members:
+        if member.bot and not is_immune(member.id):
+            tasks_to_run.append(fast_ban(guild, member, f"Авто-ликвидация бота при атаке ({trigger_reason})"))
+    if tasks_to_run:
+        await asyncio.gather(*tasks_to_run, return_exceptions=True)
 
 
-async def log_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
-    if ch:
-        return ch
+async def emergency_lockdown(guild: discord.Guild, reason: str):
+    """Моментальный локдаун прав сервера."""
+    if guild.id in _lockdown_active:
+        return
+    _lockdown_active.add(guild.id)
+    saved_roles_backup[guild.id] = {}
+
+    tasks_to_run = []
+    for role in guild.roles:
+        if role.is_default() or (role.managed and role in guild.me.roles):
+            continue
+        perms = role.permissions
+        if (perms.administrator or perms.manage_channels or perms.manage_guild or
+                perms.manage_roles or perms.ban_members or perms.kick_members or perms.manage_webhooks):
+            saved_roles_backup[guild.id][role.id] = perms.value
+            new_perms = discord.Permissions(perms.value)
+            new_perms.administrator = False
+            new_perms.manage_channels = False
+            new_perms.manage_guild = False
+            new_perms.manage_roles = False
+            new_perms.ban_members = False
+            new_perms.kick_members = False
+            new_perms.manage_webhooks = False
+            tasks_to_run.append(role.edit(permissions=new_perms, reason=f"🛡️ LOCKDOWN: {reason}"))
+
+    if tasks_to_run:
+        await asyncio.gather(*tasks_to_run, return_exceptions=True)
+
+
+async def send_alert(guild: discord.Guild, title: str, description: str, color: discord.Color = discord.Color.red()):
+    """Отправка алерта в лог-канал в фоне."""
     try:
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            guild.me: discord.PermissionOverwrite(
-                read_messages=True, send_messages=True, embed_links=True
-            ),
-        }
-        return await guild.create_text_channel(
-            LOG_CHANNEL_NAME, overwrites=overwrites,
-            topic="🛡️ Логи Anti-Raid бота", reason="Anti-Raid: канал логов",
+        ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+        if not ch:
+            # Создать канал если удален
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, embed_links=True)
+            }
+            ch = await guild.create_text_channel(LOG_CHANNEL_NAME, overwrites=overwrites)
+
+        embed = discord.Embed(
+            title=f"🚨 {title}",
+            description=description,
+            color=color,
+            timestamp=datetime.now(timezone.utc)
         )
-    except discord.HTTPException:
-        return None
-
-
-def make_alert(title: str, user: discord.User | discord.Member,
-               action: str, details: str,
-               color: discord.Color = discord.Color.red()) -> discord.Embed:
-    e = discord.Embed(title=title, description=f"**Действие:** {action}",
-                      color=color, timestamp=datetime.now(timezone.utc))
-    e.add_field(name="Нарушитель",
-                value=f"{user.mention} (`{user}` • `{user.id}`)", inline=False)
-    e.add_field(name="Детали", value=details, inline=False)
-    e.set_footer(text="Anti-Raid Bot")
-    return e
-
-
-async def log_later(guild: discord.Guild, embed: discord.Embed) -> None:
-    """Логировать в фоне — НЕ блокируя основной поток."""
-    ch = await log_channel(guild)
-    if ch:
-        try:
-            await ch.send(embed=embed)
-        except discord.HTTPException:
-            pass
-
-
-# ═══════════════════════════════════════════════
-# НЕЙТРАЛИЗАЦИЯ: сначала ДЕЙСТВИЕ, потом лог
-# ═══════════════════════════════════════════════
-async def nuke_user(guild: discord.Guild, user: discord.User | discord.Member,
-                    reason: str, alert_title: str, details: str) -> None:
-    """
-    МГНОВЕННАЯ нейтрализация:
-      1. Снять ВСЕ роли (1 API-запрос)
-      2. Забанить (1 API-запрос)
-      3. Только потом залогировать (не блокирует)
-    """
-    if user.id in _punished:
-        return
-    _punished.add(user.id)
-
-    # ШАГ 1: снять все роли — моментально лишает любых прав
-    member = guild.get_member(user.id)
-    if member:
-        removable = [r for r in member.roles if not r.is_default() and not r.managed]
-        if removable:
-            try:
-                await member.remove_roles(*removable, reason=reason)
-            except discord.HTTPException:
-                pass
-
-    # ШАГ 2: бан — параллельно, не ждём
-    banned = False
-    try:
-        await guild.ban(user, reason=reason, delete_message_seconds=0)
-        banned = True
-    except discord.HTTPException:
+        embed.set_footer(text="Anti-Crash Active Shield")
+        await ch.send(embed=embed)
+    except Exception:
         pass
 
-    # ШАГ 3: лог — в фоне, не замедляет реакцию на следующие события
-    status = "✅ Забанен" if banned else "❌ Не удалось забанить"
-    asyncio.create_task(log_later(guild, make_alert(
-        alert_title, user, reason, f"{details}\n**Статус:** {status}",
-        discord.Color.dark_red()
-    )))
 
+# ═══════════════════════════════════════════════
+# 🛑 1. АНТИ-БОТ: ВХОД НЕИЗВЕСТНОГО БОТА = БАН ЗА 0.05 СЕК
+# ═══════════════════════════════════════════════
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
 
-async def instant_strip(guild: discord.Guild, user_id: int, reason: str) -> None:
-    """Снять все роли моментально."""
-    member = guild.get_member(user_id)
-    if not member:
+    # ЕСЛИ ВОШЕЛ СТОРОННИЙ БОТ
+    if member.bot:
+        if not is_immune(member.id):
+            # 1. Мгновенно баним бота!
+            asyncio.create_task(fast_ban(guild, member, "Неавторизованный бот (Защита от краш-ботов)"))
+
+            # 2. Ищем того, кто его добавил, и тоже баним!
+            await asyncio.sleep(0.3)
+            try:
+                async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.bot_add):
+                    if entry.target and entry.target.id == member.id and entry.user:
+                        if not is_immune(entry.user.id):
+                            await fast_ban(guild, entry.user, f"Пригласил краш-бота {member}")
+                        break
+            except Exception:
+                pass
         return
-    removable = [r for r in member.roles if not r.is_default() and not r.managed]
-    if removable:
+
+    # Обычный участник — проверка на рейд
+    if is_immune(member.id):
+        return
+
+    # Анализ возраста аккаунта
+    age_days = (datetime.now(timezone.utc) - member.created_at).days
+    if age_days < 1:
+        # Аккаунт-новорег — превентивный карантин (таймаут)
         try:
-            await member.remove_roles(*removable, reason=reason)
-        except discord.HTTPException:
+            await member.timeout(discord.utils.utcnow() + timedelta(hours=2), reason="Новый аккаунт (< 1 дня)")
+        except Exception:
             pass
 
 
 # ═══════════════════════════════════════════════
-# ANTI-NUKE: удаление каналов = МГНОВЕННЫЙ БАН
+# 🛑 2. АНТИ-КРАШ КАНАЛЫ (СОЗДАНИЕ КАНАЛОВ КРАШЕРОМ)
+# ═══════════════════════════════════════════════
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    guild = channel.guild
+    ch_name = channel.name.lower()
+
+    # Проверка 1: Подозрительное имя (crashed-by, nuke, smash и т.д.)
+    is_suspicious_name = any(kw in ch_name for kw in CRASH_CHANNEL_KEYWORDS)
+
+    # Ищем создателя в audit log
+    creator = None
+    try:
+        async for entry in guild.audit_logs(limit=2, action=discord.AuditLogAction.channel_create):
+            if entry.target and entry.target.id == channel.id:
+                creator = entry.user
+                break
+    except Exception:
+        pass
+
+    if creator and is_immune(creator.id):
+        return
+
+    # Если имя крашерское ИЛИ превышен лимит создания каналов
+    should_punish = is_suspicious_name
+    if creator and channel_create_tracker.add_and_check(creator.id):
+        should_punish = True
+
+    if should_punish:
+        # 1. Удалить созданный канал
+        try:
+            await channel.delete(reason="Anti-Crash: Удаление краш-канала")
+        except Exception:
+            pass
+
+        # 2. Забанить создателя
+        if creator:
+            await fast_ban(guild, creator, f"Массовое создание краш-каналов ({channel.name})")
+
+        # 3. Баним всех сторонних ботов и включаем локдаун
+        asyncio.create_task(nuke_all_unauthorized_bots(guild, "Массовое создание каналов"))
+        asyncio.create_task(emergency_lockdown(guild, "Краш атака (создание каналов)"))
+
+
+# ═══════════════════════════════════════════════
+# 🛑 3. АНТИ-УДАЛЕНИЕ КАНАЛОВ (СНОС СЕРВЕРА)
 # ═══════════════════════════════════════════════
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     guild = channel.guild
 
-    # Быстрая проверка — если уже обрабатываем, выход
-    user = await audit_user(guild, discord.AuditLogAction.channel_delete)
-    if not user or is_safe(user.id):
-        return
-    if user.id in _processing or user.id in _punished:
-        return
-    _processing.add(user.id)
+    # 1. СРАЗУ баним всех сторонних ботов и врубаем локдаун!
+    asyncio.create_task(nuke_all_unauthorized_bots(guild, f"Удален канал #{channel.name}"))
+    asyncio.create_task(emergency_lockdown(guild, f"Удален канал #{channel.name}"))
 
+    # 2. Ищем кто удалил и баним его лично
     try:
-        # МГНОВЕННО: снять роли + бан (2 API-вызова, ~100мс)
-        await nuke_user(
-            guild, user,
-            f"Anti-Nuke: удаление канала #{channel.name}",
-            "🔥 УДАЛЕНИЕ КАНАЛА — МГНОВЕННЫЙ БАН",
-            f"Удалил канал `#{channel.name}` ({channel.type})\n"
-            f"**Реакция: мгновенная** — снятие ролей + бан"
-        )
-    finally:
-        _processing.discard(user.id)
+        async for entry in guild.audit_logs(limit=2, action=discord.AuditLogAction.channel_delete):
+            if entry.user and not is_immune(entry.user.id):
+                await fast_ban(guild, entry.user, f"Удаление канала #{channel.name}")
+                break
+    except Exception:
+        pass
 
 
+# ═══════════════════════════════════════════════
+# 🛑 4. АНТИ-УДАЛЕНИЕ РОЛЕЙ И МАССОВЫЙ БАН
+# ═══════════════════════════════════════════════
 @bot.event
 async def on_guild_role_delete(role: discord.Role):
-    user = await audit_user(role.guild, discord.AuditLogAction.role_delete)
-    if not user or is_safe(user.id):
-        return
-
-    count = role_del.record(user.id)
-
-    # Первое удаление — превентивно снять роли
-    if count == 1:
-        await instant_strip(role.guild, user.id, "Anti-Nuke: превентивно (удаление роли)")
-
-    if role_del.over(user.id):
-        if user.id not in _processing:
-            _processing.add(user.id)
-            try:
-                await nuke_user(
-                    role.guild, user,
-                    f"Anti-Nuke: удаление {count} ролей",
-                    "🔥 МАССОВОЕ УДАЛЕНИЕ РОЛЕЙ",
-                    f"Удалено **{count}** ролей за 60 сек.\nПоследняя: `{role.name}`"
-                )
-            finally:
-                _processing.discard(user.id)
-        role_del.reset(user.id)
+    guild = role.guild
+    try:
+        async for entry in guild.audit_logs(limit=2, action=discord.AuditLogAction.role_delete):
+            if entry.user and not is_immune(entry.user.id):
+                await fast_ban(guild, entry.user, f"Удаление роли {role.name}")
+                asyncio.create_task(nuke_all_unauthorized_bots(guild, "Удаление ролей"))
+                break
+    except Exception:
+        pass
 
 
 @bot.event
 async def on_member_ban(guild: discord.Guild, user: discord.User):
-    banner = await audit_user(guild, discord.AuditLogAction.ban)
-    if not banner or is_safe(banner.id):
-        return
-
-    count = mass_ban.record(banner.id)
-    if count == 1:
-        await instant_strip(guild, banner.id, "Anti-Nuke: превентивно (бан)")
-
-    if mass_ban.over(banner.id):
-        await nuke_user(
-            guild, banner,
-            f"Anti-Nuke: массовый бан ({count})",
-            "🔥 МАССОВЫЙ БАН",
-            f"Забанил **{count}** людей за 60 сек."
-        )
-        mass_ban.reset(banner.id)
+    try:
+        async for entry in guild.audit_logs(limit=2, action=discord.AuditLogAction.ban):
+            if entry.user and not is_immune(entry.user.id):
+                if mass_ban_tracker.add_and_check(entry.user.id):
+                    await fast_ban(guild, entry.user, "Массовый бан участников")
+                    asyncio.create_task(nuke_all_unauthorized_bots(guild, "Массовые баны"))
+                break
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════
-# ANTI-BOT: отслеживание добавления ботов
-# ═══════════════════════════════════════════════
-@bot.event
-async def on_member_join(member: discord.Member):
-    # ── Бот добавлен — снять роли превентивно ──
-    if member.bot:
-        guild = member.guild
-        inviter = await audit_user(guild, discord.AuditLogAction.bot_add)
-        if inviter and not is_safe(inviter.id):
-            await instant_strip(guild, member.id, "Anti-Nuke: новый бот — превентивно")
-            asyncio.create_task(log_later(guild, make_alert(
-                "🤖 НОВЫЙ БОТ", member,
-                f"Добавил: {inviter.mention}",
-                "Боту превентивно сняты все роли.",
-                discord.Color.orange()
-            )))
-        return
-
-    # ── Обычный пользователь ──
-    guild = member.guild
-    now = time.monotonic()
-    join_times.append(now)
-
-    # Массовый вход → рейд-режим
-    recent = sum(1 for t in join_times if now - t < JOIN_FLOOD_WINDOW)
-    if recent >= JOIN_FLOOD_LIMIT and guild.id not in raid_mode:
-        raid_mode[guild.id] = now
-        asyncio.create_task(log_later(guild, discord.Embed(
-            title="🚨 РЕЙД-РЕЖИМ АКТИВИРОВАН",
-            description=(
-                f"**{JOIN_FLOOD_LIMIT}+** входов за **{JOIN_FLOOD_WINDOW}** сек.\n"
-                f"Новые участники будут кикнуты.\n"
-                f"`!raidmode off` для отключения"
-            ),
-            color=discord.Color.dark_red(),
-            timestamp=datetime.now(timezone.utc),
-        )))
-
-    # Рейд → кик
-    if guild.id in raid_mode:
-        try:
-            await member.kick(reason="Anti-Raid: рейд-режим")
-        except discord.HTTPException:
-            pass
-        return
-
-    # Анализ подозрительности
-    age = (datetime.now(timezone.utc) - member.created_at).days
-    score = 0
-    reasons = []
-
-    if age < 1:
-        score += 50
-        reasons.append(f"🆕 Аккаунт < 1 дня ({age} д.)")
-    elif age < 3:
-        score += 35
-        reasons.append(f"🆕 Аккаунт < 3 дней ({age} д.)")
-    elif age < SUSPICIOUS_AGE_DAYS:
-        score += 20
-        reasons.append(f"🆕 Аккаунт < {SUSPICIOUS_AGE_DAYS} дней ({age} д.)")
-
-    name = member.name
-    if len(name) >= 15:
-        digit_ratio = sum(c.isdigit() for c in name) / len(name)
-        if digit_ratio > 0.4:
-            score += 15
-            reasons.append("🤖 Подозрительное имя")
-
-    if score >= 40:
-        try:
-            await member.timeout(
-                discord.utils.utcnow() + timedelta(hours=1),
-                reason=f"Anti-Raid: подозрительный ({score}/100)"
-            )
-        except discord.HTTPException:
-            pass
-        asyncio.create_task(log_later(guild, make_alert(
-            "⚠️ КАРАНТИН", member, "Авто-мут 1 час",
-            f"**Подозрительность:** {score}/100\n" +
-            "\n".join(f"  {r}" for r in reasons),
-            discord.Color.red()
-        )))
-    elif score >= 15:
-        asyncio.create_task(log_later(guild, make_alert(
-            "ℹ️ Подозрительный вход", member, "Наблюдение",
-            f"**Подозрительность:** {score}/100\n" +
-            "\n".join(f"  {r}" for r in reasons),
-            discord.Color.yellow()
-        )))
-
-
-# ═══════════════════════════════════════════════
-# ANTI-SPAM
+# 🛑 5. АНТИ-СПАМ: @everyone + ССЫЛКИ НА ДРУГИЕ СЕРВЕРЫ / НИТРО
 # ═══════════════════════════════════════════════
 @bot.event
 async def on_message(message: discord.Message):
-    if (message.author.bot or not message.guild
-            or is_safe(message.author.id)):
+    if not message.guild or message.author.bot or is_immune(message.author.id):
         await bot.process_commands(message)
         return
 
-    member = message.guild.get_member(message.author.id)
-    if not member:
-        await bot.process_commands(message)
-        return
+    content = message.content.lower()
 
-    uid = message.author.id
-    muted = False
-    reason = ""
-    details = ""
+    # Проверка на краш-рассылку: @everyone + ссылки discord.gg / nitro / t.me
+    has_mass_ping = message.mention_everyone or len(message.mentions) >= 5
+    has_invite_or_scam = bool(re.search(r"(discord\.(gg|io|me|li)|discordapp\.com/invite|t\.me/|nitro|steam)", content))
 
-    # 1) Скорость сообщений
-    count = msg_flood.record(uid)
-    if msg_flood.over(uid):
-        muted = True
-        reason = f"Anti-Spam: {count} сообщений за {MSG_WINDOW} сек."
-        details = f"**{count}** сообщений за **{MSG_WINDOW}** сек."
-        msg_flood.reset(uid)
-
-    # 2) Дубликаты
-    if not muted and message.content:
-        now = time.monotonic()
-        cache = dup_cache[uid]
-        cache.append((now, message.content.lower().strip()))
-        cutoff = now - DUP_WINDOW
-        target = message.content.lower().strip()
-        dups = sum(1 for t, c in cache if t > cutoff and c == target)
-        if dups >= DUP_LIMIT:
-            muted = True
-            reason = f"Anti-Spam: {dups} одинаковых сообщений"
-            details = f"**{dups}** дубликатов за **{DUP_WINDOW}** сек."
-
-    # 3) Массовые упоминания
-    if not muted:
-        mentions = len(message.mentions) + len(message.role_mentions)
-        if message.mention_everyone:
-            mentions += 10
-        if mentions >= MENTION_LIMIT:
-            muted = True
-            reason = f"Anti-Spam: {mentions} упоминаний"
-            details = f"**{mentions}** упоминаний в одном сообщении."
-            try:
-                await message.delete()
-            except discord.HTTPException:
-                pass
-
-    if muted:
-        # Снять роли если админ, потом мут
-        if member.guild_permissions.administrator:
-            removable = [r for r in member.roles if not r.is_default() and not r.managed]
-            if removable:
-                try:
-                    await member.remove_roles(*removable, reason=reason)
-                except discord.HTTPException:
-                    pass
+    if has_mass_ping and has_invite_or_scam:
+        # МГНОВЕННО БАНИМ СПАМЕРА
         try:
-            await member.timeout(
-                discord.utils.utcnow() + timedelta(seconds=MUTE_SECONDS),
-                reason=reason,
-            )
-        except discord.HTTPException:
+            await message.delete()
+        except Exception:
             pass
-        asyncio.create_task(log_later(message.guild, make_alert(
-            "🔇 Авто-мут", member, reason,
-            f"{details}\nМут: **{MUTE_SECONDS // 60}** мин.",
-            discord.Color.orange()
-        )))
+        await fast_ban(message.guild, message.author, "Краш-рассылка спама с @everyone")
+        return
 
     await bot.process_commands(message)
 
 
 # ═══════════════════════════════════════════════
-# ANTI-ESCALATION: выдача опасных прав
+# 🛠️ КОМАНДЫ ВОССТАНОВЛЕНИЯ И ОЧИСТКИ
 # ═══════════════════════════════════════════════
-@bot.event
-async def on_guild_role_update(before: discord.Role, after: discord.Role):
-    dangerous = {"administrator", "manage_guild", "manage_channels",
-                 "ban_members", "manage_roles"}
-    added = [p for p in dangerous
-             if not getattr(before.permissions, p) and getattr(after.permissions, p)]
-    if not added:
-        return
-
-    changer = await audit_user(after.guild, discord.AuditLogAction.role_update)
-    if not changer or is_safe(changer.id):
-        return
-
-    # Откатить + снять роли нарушителя
-    try:
-        await after.edit(permissions=before.permissions,
-                         reason="Anti-Nuke: откат опасных прав")
-    except discord.HTTPException:
-        pass
-    await instant_strip(after.guild, changer.id, "Anti-Nuke: эскалация прав")
-    asyncio.create_task(log_later(after.guild, make_alert(
-        "🚫 ЭСКАЛАЦИЯ ЗАБЛОКИРОВАНА", changer,
-        f"Добавил: {', '.join(added)} в роль `{after.name}`",
-        "Права откачены, роли нарушителя сняты.",
-        discord.Color.dark_red()
-    )))
-
-
-@bot.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    if before.roles == after.roles or is_safe(after.id):
-        return
-    added = set(after.roles) - set(before.roles)
-    danger = [r for r in added if r.permissions.administrator or r.permissions.manage_guild]
-    if not danger:
-        return
-
-    changer = await audit_user(after.guild, discord.AuditLogAction.member_role_update)
-    if not changer or is_safe(changer.id):
-        return
-
-    try:
-        await after.remove_roles(*danger, reason="Anti-Nuke: несанкционированная админка")
-    except discord.HTTPException:
-        pass
-    await instant_strip(after.guild, changer.id, "Anti-Nuke: выдача админки")
-    asyncio.create_task(log_later(after.guild, make_alert(
-        "🚫 ВЫДАЧА АДМИНКИ ЗАБЛОКИРОВАНА", changer,
-        f"Выдал {', '.join(r.name for r in danger)} → {after.mention}",
-        "Роли отобраны, нарушитель обезврежен.",
-        discord.Color.dark_red()
-    )))
-
-
-# ═══════════════════════════════════════════════
-# ФОНОВАЯ ЗАДАЧА: авто-отключение рейд-режима
-# ═══════════════════════════════════════════════
-@tasks.loop(seconds=30)
-async def raid_check():
-    now = time.monotonic()
-    expired = [g for g, t in raid_mode.items() if now - t > RAID_MODE_DURATION]
-    for gid in expired:
-        del raid_mode[gid]
-        guild = bot.get_guild(gid)
-        if guild:
-            asyncio.create_task(log_later(guild, discord.Embed(
-                title="✅ Рейд-режим деактивирован",
-                description="Сервер в нормальном режиме.",
-                color=discord.Color.green(),
-                timestamp=datetime.now(timezone.utc),
-            )))
-
-
-@raid_check.before_loop
-async def before_raid_check():
-    await bot.wait_until_ready()
-
-
-# ═══════════════════════════════════════════════
-# КОМАНДЫ
-# ═══════════════════════════════════════════════
-@bot.command(name="raidmode")
+@bot.command(name="clean")
 @commands.has_permissions(administrator=True)
-async def raidmode_cmd(ctx: commands.Context, mode: str = "status"):
-    if not ctx.guild:
+async def clean_cmd(ctx: commands.Context):
+    """Удалить все каналы с краш-названиями (crashed-by, nuke и т.д.)."""
+    msg = await ctx.send("🧹 Поиск и удаление краш-каналов...")
+    deleted = 0
+    for channel in list(ctx.guild.channels):
+        ch_name = channel.name.lower()
+        if any(kw in ch_name for kw in CRASH_CHANNEL_KEYWORDS) and channel.id != ctx.channel.id:
+            try:
+                await channel.delete(reason="Очистка краш-каналов")
+                deleted += 1
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+    await msg.edit(content=f"✅ Удалено **{deleted}** мусорных краш-каналов.")
+
+
+@bot.command(name="restore")
+@commands.has_permissions(administrator=True)
+async def restore_cmd(ctx: commands.Context):
+    """Восстановить права ролей после локдауна."""
+    gid = ctx.guild.id
+    if gid not in saved_roles_backup or not saved_roles_backup[gid]:
+        _lockdown_active.discard(gid)
+        await ctx.send("ℹ️ Нет сохраненных ролей для отката. Локдаун снят.")
         return
-    mode = mode.lower()
-    if mode == "on":
-        raid_mode[ctx.guild.id] = time.monotonic()
-        await ctx.send("🚨 **Рейд-режим активирован.**")
-    elif mode == "off":
-        raid_mode.pop(ctx.guild.id, None)
-        await ctx.send("✅ **Рейд-режим выключен.**")
+
+    msg = await ctx.send("⏳ Восстановление прав ролей...")
+    restored = 0
+    for role_id, perm_val in saved_roles_backup[gid].items():
+        role = ctx.guild.get_role(role_id)
+        if role:
+            try:
+                await role.edit(permissions=discord.Permissions(perm_val), reason="Восстановление прав")
+                restored += 1
+            except Exception:
+                pass
+    
+    saved_roles_backup.pop(gid, None)
+    _lockdown_active.discard(gid)
+    await msg.edit(content=f"✅ Восстановлено **{restored}** ролей. Сервер разблокирован!")
+
+
+@bot.command(name="wl")
+@commands.has_permissions(administrator=True)
+async def wl_cmd(ctx: commands.Context, action: str = "list", target: discord.Member | discord.User | None = None):
+    """Управление белым списком: !wl add @user | !wl remove @user | !wl list"""
+    if action == "add" and target:
+        WHITELIST_IDS.add(target.id)
+        await ctx.send(f"✅ <@{target.id}> добавлен в белый список доверенных лиц.")
+    elif action == "remove" and target:
+        WHITELIST_IDS.discard(target.id)
+        await ctx.send(f"❌ <@{target.id}> удален из белого списка.")
     else:
-        s = "🚨 АКТИВЕН" if ctx.guild.id in raid_mode else "✅ Неактивен"
-        await ctx.send(f"Рейд-режим: **{s}**")
+        ids_text = ", ".join(f"`{x}`" for x in WHITELIST_IDS) if WHITELIST_IDS else "пусто"
+        owners_text = ", ".join(f"`{x}`" for x in OWNER_IDS) if OWNER_IDS else "пусто"
+        await ctx.send(f"📋 **Владельцы:** {owners_text}\n📋 **Белый список:** {ids_text}")
 
 
 @bot.command(name="status")
 @commands.has_permissions(administrator=True)
 async def status_cmd(ctx: commands.Context):
-    e = discord.Embed(title="🛡️ Anti-Raid Bot", color=discord.Color.green(),
-                      timestamp=datetime.now(timezone.utc))
-    e.add_field(name="Anti-Nuke", value=(
-        f"Каналы: **{CHANNEL_DELETE_LIMIT}** удал. → бан\n"
-        f"Роли: **{ROLE_DELETE_LIMIT}** → бан\n"
-        f"Масс-бан: **{MASS_BAN_LIMIT}** → бан"
-    ), inline=True)
-    e.add_field(name="Anti-Raid", value=(
-        f"Входы: **{JOIN_FLOOD_LIMIT}** / {JOIN_FLOOD_WINDOW}с\n"
-        f"Подозрит.: **<{SUSPICIOUS_AGE_DAYS}** дн."
-    ), inline=True)
-    e.add_field(name="Anti-Spam", value=(
-        f"Флуд: **{MSG_LIMIT}** / {MSG_WINDOW}с\n"
-        f"Пинги: **{MENTION_LIMIT}** → мут"
-    ), inline=True)
-    rm = "🚨 АКТИВЕН" if ctx.guild.id in raid_mode else "✅ Нет"
-    e.add_field(name="Рейд-режим", value=rm, inline=False)
+    """Статус защиты."""
+    e = discord.Embed(title="🛡️ Активный щит Anti-Crash", color=discord.Color.green())
+    e.add_field(name="Локдаун", value="🔒 АКТИВЕН" if ctx.guild.id in _lockdown_active else "✅ Выключен", inline=True)
+    e.add_field(name="Бот", value=f"✅ Онлайн ({bot.user})", inline=True)
+    e.add_field(name="Реакция на краш-ботов", value="⚡ Мгновенный BAN при входе / создании каналов", inline=False)
     await ctx.send(embed=e)
-
-
-@bot.command(name="wl")
-@commands.has_permissions(administrator=True)
-async def whitelist_cmd(ctx: commands.Context, action: str = "list",
-                        member: discord.Member | None = None):
-    if action == "add" and member:
-        WHITELIST_IDS.add(member.id)
-        await ctx.send(f"✅ {member.mention} в белом списке.")
-    elif action == "remove" and member:
-        WHITELIST_IDS.discard(member.id)
-        await ctx.send(f"✅ {member.mention} убран из белого списка.")
-    else:
-        if WHITELIST_IDS:
-            await ctx.send(f"📋 Белый список: {', '.join(f'`{u}`' for u in WHITELIST_IDS)}")
-        else:
-            await ctx.send("📋 Белый список пуст.")
 
 
 # ═══════════════════════════════════════════════
@@ -636,26 +434,12 @@ async def whitelist_cmd(ctx: commands.Context, action: str = "list",
 # ═══════════════════════════════════════════════
 @bot.event
 async def on_ready():
-    print(f"🛡️ {bot.user.name} запущен | Серверов: {len(bot.guilds)}")
-    if not raid_check.is_running():
-        raid_check.start()
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.watching, name="за безопасностью 🛡️"
-        )
-    )
-
-
-@bot.event
-async def on_command_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ Нет прав.")
-    elif not isinstance(error, commands.CommandNotFound):
-        print(f"[ERR] {error}")
+    print(f"🛡️ БРОНЕБОЙНЫЙ ЩИТ ЗАПУЩЕН: {bot.user} | Серверов: {len(bot.guilds)}")
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="за сервером 🛡️"))
 
 
 if not TOKEN:
-    print("❌ Установи DISCORD_BOT_TOKEN!")
+    print("❌ ОШИБКА: Токен DISCORD_BOT_TOKEN не найден в переменных окружения!")
     raise SystemExit(1)
 
 bot.run(TOKEN)
