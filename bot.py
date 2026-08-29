@@ -391,6 +391,34 @@ async def on_message(message: discord.Message):
         await fast_ban(message.guild, message.author, "Краш-рассылка с @everyone")
         return
 
+    # 2. Спам @everyone / @here (3 и более упоминаний в 1 сообщении -> удаление + мут на 5 мин)
+    everyone_count = content_lower.count("@everyone") + content_lower.count("@here")
+    if everyone_count >= 3 or len(message.mentions) >= 6:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        member = message.guild.get_member(uid)
+        if member:
+            if member.guild_permissions.administrator:
+                removable = [r for r in member.roles if not r.is_default() and not r.managed]
+                if removable:
+                    try:
+                        await member.remove_roles(*removable, reason="Анти-Спам: 3+ @everyone")
+                    except Exception:
+                        pass
+            try:
+                await member.timeout(discord.utils.utcnow() + timedelta(minutes=5), reason="Анти-Спам: 3+ упоминаний @everyone в сообщении")
+                asyncio.create_task(send_alert(
+                    message.guild,
+                    "🔇 АВТО-МУТ ЗА МАССОВЫЙ ПИНГ @everyone",
+                    f"**Нарушитель:** {member.mention} (`{member.id}`)\n**Причина:** Отправлено {everyone_count} @everyone/@here в одном сообщении",
+                    discord.Color.orange()
+                ))
+            except Exception:
+                pass
+        return
+
     # 2. Проверка на одинаковые (дублирующиеся) сообщения
     if content:
         # Очищаем старые записи (> 12 секунд)
