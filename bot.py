@@ -190,19 +190,15 @@ async def strip_and_ban(guild: discord.Guild, user: discord.User | discord.Membe
         return
     punished.add(user.id)
 
-    # Снять опасные роли
+    # Снять ВСЕ роли разом (убирает админку → бан/мут начинают работать)
     member = guild.get_member(user.id)
     if member:
-        dangerous = {"administrator", "manage_guild", "manage_channels",
-                     "manage_roles", "ban_members", "kick_members"}
-        for role in member.roles:
-            if role.is_default() or role.managed:
-                continue
-            if any(getattr(role.permissions, p, False) for p in dangerous):
-                try:
-                    await member.remove_roles(role, reason=reason)
-                except discord.HTTPException:
-                    pass
+        removable = [r for r in member.roles if not r.is_default() and not r.managed]
+        if removable:
+            try:
+                await member.remove_roles(*removable, reason=reason)
+            except discord.HTTPException:
+                pass
 
     # Бан
     banned = False
@@ -220,6 +216,22 @@ async def strip_and_ban(guild: discord.Guild, user: discord.User | discord.Membe
 
 
 # ═══════════════════════════════════════════════
+# БЫСТРАЯ НЕЙТРАЛИЗАЦИЯ — снять роли моментально
+# ═══════════════════════════════════════════════
+async def instant_strip(guild: discord.Guild, user_id: int, reason: str) -> None:
+    """Моментально снять ВСЕ роли у пользователя (превентивно)."""
+    member = guild.get_member(user_id)
+    if not member:
+        return
+    removable = [r for r in member.roles if not r.is_default() and not r.managed]
+    if removable:
+        try:
+            await member.remove_roles(*removable, reason=reason)
+        except discord.HTTPException:
+            pass
+
+
+# ═══════════════════════════════════════════════
 # ANTI-NUKE: удаление каналов / ролей / массовые баны
 # ═══════════════════════════════════════════════
 @bot.event
@@ -230,6 +242,21 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
 
     count = ch_del.record(user.id)
 
+    # ⚡ ПЕРВОЕ удаление — СРАЗУ снять все роли (превентивно!)
+    if count == 1:
+        await instant_strip(
+            channel.guild, user.id,
+            "Anti-Nuke: превентивное снятие ролей (удаление канала)"
+        )
+        await log_embed(channel.guild, alert(
+            "⚡ ПРЕВЕНТИВНАЯ ЗАЩИТА", user,
+            f"Удалил #{channel.name} — роли сняты!",
+            f"Все роли сняты превентивно.\n"
+            f"Ещё **{CHANNEL_DELETE_LIMIT - count}** удаление = **бан**.",
+            discord.Color.orange()
+        ))
+
+    # 2+ удалений — БАН
     if ch_del.over(user.id):
         await strip_and_ban(
             channel.guild, user,
@@ -238,15 +265,6 @@ async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
             f"Удалено **{count}** каналов за 60 сек.\nПоследний: `#{channel.name}`"
         )
         ch_del.reset(user.id)
-    else:
-        remain = CHANNEL_DELETE_LIMIT - count
-        await log_embed(channel.guild, alert(
-            "⚠️ Удаление канала", user,
-            f"Удалил #{channel.name}",
-            f"Удалено за окно: **{count}/{CHANNEL_DELETE_LIMIT}**\n"
-            f"Ещё **{remain}** до авто-бана",
-            discord.Color.orange()
-        ))
 
 
 @bot.event
@@ -255,6 +273,14 @@ async def on_guild_role_delete(role: discord.Role):
     if not user or is_safe(user.id):
         return
     count = role_del.record(user.id)
+
+    # ⚡ Первое удаление роли — превентивное снятие ролей
+    if count == 1:
+        await instant_strip(
+            role.guild, user.id,
+            "Anti-Nuke: превентивное снятие ролей (удаление роли)"
+        )
+
     if role_del.over(user.id):
         await strip_and_ban(
             role.guild, user,
@@ -271,6 +297,11 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
     if not banner or is_safe(banner.id):
         return
     count = mass_ban.record(banner.id)
+
+    # ⚡ Первый бан — превентивное снятие ролей
+    if count == 1:
+        await instant_strip(guild, banner.id, "Anti-Nuke: превентивно (массовый бан)")
+
     if mass_ban.over(banner.id):
         await strip_and_ban(
             guild, banner,
@@ -282,11 +313,24 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 
 
 # ═══════════════════════════════════════════════
-# ANTI-RAID: массовый вход + подозрительные аккаунты
+# ANTI-BOT: отслеживание добавления ботов
 # ═══════════════════════════════════════════════
 @bot.event
 async def on_member_join(member: discord.Member):
+    # ── Если добавлен БОТ — проверить кто добавил ──
     if member.bot:
+        guild = member.guild
+        entry = await audit_user(guild, discord.AuditLogAction.bot_add)
+        if entry and not is_safe(entry.id):
+            # Снять все роли у добавленного бота
+            await instant_strip(guild, member.id, "Anti-Nuke: новый бот — превентивно")
+            await log_embed(guild, alert(
+                "🤖 НОВЫЙ БОТ ДОБАВЛЕН", member,
+                f"Добавлен пользователем: {entry.mention}",
+                f"Боту превентивно сняты все роли.\n"
+                f"Если бот начнёт удалять каналы — будет забанен.",
+                discord.Color.orange()
+            ))
         return
 
     guild = member.guild
@@ -387,7 +431,7 @@ async def on_message(message: discord.Message):
         return
 
     member = message.guild.get_member(message.author.id)
-    if not member or member.guild_permissions.administrator:
+    if not member:
         await bot.process_commands(message)
         return
 
@@ -431,6 +475,14 @@ async def on_message(message: discord.Message):
                 pass
 
     if muted:
+        # Если у нарушителя есть админка — снять ВСЕ роли, иначе timeout не сработает
+        if member.guild_permissions.administrator:
+            removable = [r for r in member.roles if not r.is_default() and not r.managed]
+            if removable:
+                try:
+                    await member.remove_roles(*removable, reason=reason)
+                except discord.HTTPException:
+                    pass
         try:
             await member.timeout(
                 discord.utils.utcnow() + timedelta(seconds=MUTE_SECONDS),
@@ -445,6 +497,91 @@ async def on_message(message: discord.Message):
         ))
 
     await bot.process_commands(message)
+
+
+# ═══════════════════════════════════════════════
+# ANTI-ESCALATION: отслеживание выдачи опасных прав
+# ═══════════════════════════════════════════════
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    """Если кто-то добавил опасные права в роль — откатить."""
+    if is_safe(after.guild.owner_id or 0):
+        pass  # владелец сервера может всё
+
+    dangerous = {"administrator", "manage_guild", "manage_channels",
+                 "ban_members", "manage_roles"}
+
+    added_perms = []
+    for perm in dangerous:
+        if not getattr(before.permissions, perm) and getattr(after.permissions, perm):
+            added_perms.append(perm)
+
+    if not added_perms:
+        return
+
+    # Кто изменил роль?
+    changer = await audit_user(after.guild, discord.AuditLogAction.role_update)
+    if not changer or is_safe(changer.id):
+        return
+
+    # Откатить права
+    try:
+        await after.edit(permissions=before.permissions,
+                         reason="Anti-Nuke: откат опасных прав")
+    except discord.HTTPException:
+        pass
+
+    # Снять роли у того, кто это сделал
+    await instant_strip(after.guild, changer.id,
+                        "Anti-Nuke: попытка эскалации прав")
+
+    await log_embed(after.guild, alert(
+        "🚫 ЭСКАЛАЦИЯ ПРАВ ЗАБЛОКИРОВАНА", changer,
+        f"Попытался добавить: {', '.join(added_perms)}",
+        f"Роль: `{after.name}`\n"
+        f"Права откачены, роли нарушителя сняты.",
+        discord.Color.dark_red()
+    ))
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Если кому-то выдали роль с админкой — проверить."""
+    if before.roles == after.roles:
+        return
+    if is_safe(after.id):
+        return
+
+    added_roles = set(after.roles) - set(before.roles)
+    dangerous_added = [r for r in added_roles
+                       if r.permissions.administrator or r.permissions.manage_guild]
+
+    if not dangerous_added:
+        return
+
+    # Кто выдал роль?
+    changer = await audit_user(after.guild, discord.AuditLogAction.member_role_update)
+    if not changer or is_safe(changer.id):
+        return
+
+    # Снять выданные опасные роли
+    try:
+        await after.remove_roles(*dangerous_added,
+                                 reason="Anti-Nuke: несанкционированная выдача админки")
+    except discord.HTTPException:
+        pass
+
+    # Снять роли у того, кто выдал
+    await instant_strip(after.guild, changer.id,
+                        "Anti-Nuke: несанкционированная выдача админки")
+
+    roles_str = ", ".join(f"`{r.name}`" for r in dangerous_added)
+    await log_embed(after.guild, alert(
+        "🚫 ВЫДАЧА АДМИНКИ ЗАБЛОКИРОВАНА", changer,
+        f"Выдал {roles_str} → {after.mention}",
+        f"Роли отобраны у получателя, права нарушителя сняты.",
+        discord.Color.dark_red()
+    ))
 
 
 # ═══════════════════════════════════════════════
