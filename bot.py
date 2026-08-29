@@ -393,30 +393,38 @@ async def on_message(message: discord.Message):
 
     # 2. Спам @everyone / @here (3 и более упоминаний в 1 сообщении -> удаление + мут на 5 мин)
     everyone_count = content_lower.count("@everyone") + content_lower.count("@here")
-    if everyone_count >= 3 or len(message.mentions) >= 6:
+    # Также проверяем сырой текст или если включен mention_everyone с повторяющимся текстом
+    if everyone_count >= 3 or (message.mention_everyone and everyone_count >= 2) or len(message.mentions) >= 6:
         try:
             await message.delete()
         except Exception:
             pass
+
         member = message.guild.get_member(uid)
         if member:
-            if member.guild_permissions.administrator:
-                removable = [r for r in member.roles if not r.is_default() and not r.managed]
-                if removable:
-                    try:
-                        await member.remove_roles(*removable, reason="Анти-Спам: 3+ @everyone")
-                    except Exception:
-                        pass
+            # Discord запрещает мутить владельца сервера (создателя с короной)
+            if member.id == message.guild.owner_id:
+                print(f"[INFO] {member} является Владельцем сервера — Discord API запрещает ботам мутить создателя сервера.")
+                return
+
+            # Если у нарушителя есть роли администратора — снимаем их, иначе Discord не даст замутить
+            removable = [r for r in member.roles if not r.is_default() and not r.managed]
+            if removable:
+                try:
+                    await member.remove_roles(*removable, reason="Анти-Спам: снятие прав перед мутом")
+                except Exception as e:
+                    print(f"[WARN] Не удалось снять роли у {member}: {e}")
+
             try:
                 await member.timeout(discord.utils.utcnow() + timedelta(minutes=5), reason="Анти-Спам: 3+ упоминаний @everyone в сообщении")
                 asyncio.create_task(send_alert(
                     message.guild,
                     "🔇 АВТО-МУТ ЗА МАССОВЫЙ ПИНГ @everyone",
-                    f"**Нарушитель:** {member.mention} (`{member.id}`)\n**Причина:** Отправлено {everyone_count} @everyone/@here в одном сообщении",
+                    f"**Нарушитель:** {member.mention} (`{member.id}`)\n**Причина:** Отправлено 3+ @everyone в одном сообщении (Таймаут на 5 мин)",
                     discord.Color.orange()
                 ))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[ERROR TIMEOUT] Ошибка мута {member}: {e}")
         return
 
     # 2. Проверка на одинаковые (дублирующиеся) сообщения
